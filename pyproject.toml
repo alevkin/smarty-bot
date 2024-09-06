@@ -13,6 +13,8 @@ pytest = "^7.3.1"
 telethon = "^1.36.0"
 pytonapi = "0.3.8"
 python-dotenv = "^1.0.1"
+sqlmodel = "^0.0.22"
+alembic = "^1.13.2"
 
 
 [build-system]

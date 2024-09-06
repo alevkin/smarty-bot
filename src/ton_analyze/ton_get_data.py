@@ -1,27 +1,22 @@
 from pytonapi import AsyncTonapi
-# dotenv is used to load the API key from the .env file
 from dotenv import load_dotenv
 import os
-import sqlite3
 import base64
+from sqlmodel import SQLModel, create_engine, Session, select
+from src.ton_analyze.models.base import JettonHolder, Jetton
+import asyncio
 
 # Load the API key from the .env file
 load_dotenv()
 
 JETTON_DECIMALS = 9
 
-# Create a connection to the SQLite database (or modify to use another database)
-db_conn = sqlite3.connect('jetton_holders.db')
-cursor = db_conn.cursor()
+# Создаем подключение к базе данных через SQLModel
+DATABASE_URL = "sqlite:///./database.db"
+engine = create_engine(DATABASE_URL)
 
-# Create the table if it doesn't exist
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS jetton_holders (
-        owner_address_raw TEXT,
-        owner_name TEXT,
-        balance REAL
-    )
-''')
+# Создаем таблицы в базе данных (если они еще не созданы)
+SQLModel.metadata.create_all(engine)
 
 class TONAddressConverter:
     bounceable_tag = b"\x11"
@@ -91,44 +86,6 @@ class TONAddressConverter:
         }
 
     @classmethod
-    def read_friendly_address(cls, address):
-        urlsafe = False
-        if set(address).issubset(cls.b64_abc):
-            address_bytes = base64.b64decode(address.encode("utf8"))
-        elif set(address).issubset(cls.b64_abc_urlsafe):
-            urlsafe = True
-            address_bytes = base64.urlsafe_b64decode(address.encode("utf8"))
-        else:
-            raise Exception("Not an address")
-        if not cls.calcCRC(address_bytes[:-2]) == address_bytes[-2:]:
-            raise Exception("Wrong checksum")
-        tag = address_bytes[0]
-        if tag & 0x80:
-            test_only = True
-            tag = tag ^ 0x80
-        else:
-            test_only = False
-        tag = tag.to_bytes(1, "big")
-        if tag == cls.bounceable_tag:
-            bounceable = True
-        elif tag == cls.non_bounceable_tag:
-            bounceable = False
-        else:
-            raise Exception("Unknown tag")
-        if address_bytes[1:2] == b"\xff":
-            workchain = -1
-        else:
-            workchain = address_bytes[1]
-        hx = hex(int.from_bytes(address_bytes[2:-2], "big"))[2:]
-        hx = (64 - len(hx)) * "0" + hx
-        raw_form = str(workchain) + ":" + hx
-        account = cls.account_forms(raw_form, test_only)
-        account["given_type"] = "friendly_" + (
-            "bounceable" if bounceable else "non_bounceable"
-        )
-        return account
-
-    @classmethod
     def detect_address(cls, unknown_form):
         if cls.is_hex(unknown_form):
             return cls.account_forms("-1:" + unknown_form)
@@ -153,24 +110,30 @@ async def get_account_info(address, tonapi):
     return account
 
 async def process_jetton_holders(tonapi, jetton_holders, jetton_decimals):
-    for holder in jetton_holders.addresses:
-        owner_address_raw = holder.owner.address.root
-        owner_address_nonbounceable = converter.detect_address(holder.owner.address.root)["non_bounceable"]["b64url"]
-        owner_address_bounceable = converter.detect_address(holder.owner.address.root)["bounceable"]["b64url"]
-        owner_name = holder.owner.name if holder.owner.name else "Unknown"
-        raw_balance = int(holder.balance)
+    # Открываем сессию для записи в базу данных
+    with Session(engine) as session:
+        for holder in jetton_holders.addresses:
+            owner_address_raw = holder.owner.address.root
+            owner_address_nonbounceable = converter.detect_address(holder.owner.address.root)["non_bounceable"]["b64url"]
+            owner_address_bounceable = converter.detect_address(holder.owner.address.root)["bounceable"]["b64url"]
+            owner_name = holder.owner.name if holder.owner.name else "Unknown"
+            raw_balance = int(holder.balance)
 
-        # Adjust balance according to jetton decimals
-        balance = raw_balance / (10 ** jetton_decimals)
+            # Adjust balance according to jetton decimals
+            balance = raw_balance / (10 ** jetton_decimals)
 
-        # Insert holder data into the database
-        cursor.execute('''
-            INSERT INTO jetton_holders (owner_address_raw, owner_name, balance)
-            VALUES (?, ?, ?)
-        ''', (owner_address_raw, owner_name, balance))
+            # Создаем объект JettonHolder для записи в базу данных
+            jetton_holder = JettonHolder(
+                holder_address=owner_address_raw,
+                owner_name=owner_name,
+                balance=balance
+            )
 
-    # Commit the transaction
-    db_conn.commit()
+            # Добавляем держателя в сессию
+            session.add(jetton_holder)
+
+        # Коммитим все изменения в базу данных
+        session.commit()
 
 
 # Declare an asynchronous function for using await
@@ -184,11 +147,6 @@ async def main():
 
     # Retrieve account information asynchronously
     account = await tonapi.accounts.get_info(account_id=account_id)
-    #jetton = await tonapi.jettons.get_info(account_id=jettton_master_address)
-    #jetton_holders = await tonapi.jettons.get_holders(account_id=jettton_master_address)
-    # Print account details
-    #print(f"Account Address (raw): {account.address.to_raw()}")
-    #print(f"Account Balance (nanoton): {account.balance.to_nano()}")
     print(f"Account methods: {account.get_methods}")
     print(f"Account interfaces: {account.interfaces}")
 
@@ -212,13 +170,5 @@ async def main():
         await process_jetton_holders(tonapi, jetton_holders, int(jetton.metadata.decimals))
 
 
-    #print(f"Jetton Holders count: {jetton.holders_count}")
-    #print(f"Jetton Holders: {jetton_holders}")
-
-
-
 if __name__ == '__main__':
-    import asyncio
-
-    # Run the asynchronous function
     asyncio.run(main())
