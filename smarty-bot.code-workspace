@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"workbench.colorTheme": "AMOLED Black",
+		"workbench.preferredLightColorTheme": "Gruvbox Dark Hard",
+		"window.autoDetectColorScheme": false,
+		"workbench.preferredDarkColorTheme": "Gruvbox Dark Hard",
+		"workbench.iconTheme": "Monokai Pro Monochrome Icons",
+		"editor.fontSize": 16,
+		"editor.tabSize": 4,
+		"editor.minimap.sectionHeaderFontSize": 9
+	}
+}
