@@ -3,17 +3,35 @@ from dotenv import load_dotenv
 import os
 import base64
 from sqlmodel import SQLModel, create_engine, Session, select
-from src.ton_analyze.models.base import JettonHolder, Jetton
+from src.ton_analyze.models.base import JettonHolder, Jetton, Snapshot
 import asyncio
+from datetime import datetime, timezone
+
+from rich import print
+from rich.console import Console
+from rich.progress import Progress
+import time
+
+console = Console()
 
 # Load the API key from the .env file
 load_dotenv()
 
+# Читаем переменную TON_API_RATELIMIT из .env
+TON_API_RATELIMIT = int(os.getenv("TON_API_RATELIMIT", 1))  # по умолчанию 1 запрос в секунду
+
+# Устанавливаем максимальный лимит в зависимости от API тарифа
+API_LIMIT = int(os.getenv("API_LIMIT", 1000))  # Лимит записей на один запрос, по умолчанию 1000
+
 JETTON_DECIMALS = 9
 
 # Создаем подключение к базе данных через SQLModel
-DATABASE_URL = "sqlite:///./database.db"
-engine = create_engine(DATABASE_URL)
+# DATABASE_URL = "sqlite:///./database.db"
+# DATABASE_URL = "postgresql+psycopg2://smartybot:gfhjkm@localhost/smartybase"
+DATABASE_URL = f"postgresql+psycopg2://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}" \
+               f"@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+#engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL) # Устанавливаем уровень изоляции транзакций
 
 # Создаем таблицы в базе данных (если они еще не созданы)
 SQLModel.metadata.create_all(engine)
@@ -109,32 +127,120 @@ async def get_account_info(address, tonapi):
     account = await tonapi.accounts.get_info(account_id=address)
     return account
 
-async def process_jetton_holders(tonapi, jetton_holders, jetton_decimals):
-    # Открываем сессию для записи в базу данных
+async def process_jetton_holders(jetton_holders, jetton_decimals, jetton_info):
     with Session(engine) as session:
-        for holder in jetton_holders.addresses:
-            owner_address_raw = holder.owner.address.root
-            owner_address_nonbounceable = converter.detect_address(holder.owner.address.root)["non_bounceable"]["b64url"]
-            owner_address_bounceable = converter.detect_address(holder.owner.address.root)["bounceable"]["b64url"]
-            owner_name = holder.owner.name if holder.owner.name else "Unknown"
-            raw_balance = int(holder.balance)
+        # Проверяем, существует ли уже запись о жетоне
+        statement = select(Jetton).where(Jetton.jetton_symbol == jetton_info.metadata.symbol)
+        existing_jetton = session.exec(statement).first()
 
-            # Adjust balance according to jetton decimals
-            balance = raw_balance / (10 ** jetton_decimals)
-
-            # Создаем объект JettonHolder для записи в базу данных
-            jetton_holder = JettonHolder(
-                holder_address=owner_address_raw,
-                owner_name=owner_name,
-                balance=balance
+        if not existing_jetton:
+            # Если жетон не найден, создаем новую запись в таблице Jetton
+            new_jetton = Jetton(
+                jetton_name=jetton_info.metadata.name,
+                jetton_symbol=jetton_info.metadata.symbol,
+                jetton_decimals=jetton_info.metadata.decimals,
+                total_supply=int(jetton_info.total_supply) / (10 ** int(jetton_info.metadata.decimals))
             )
+            session.add(new_jetton)
+            session.commit()  # Сохраняем изменения
+            session.refresh(new_jetton)  # Обновляем объект, чтобы получить его id
+        else:
+            new_jetton = existing_jetton  # Используем уже существующий жетон
 
-            # Добавляем держателя в сессию
-            session.add(jetton_holder)
+        # Таймер для измерения времени вставки
+        start_time = time.time()
+        total_records = len(jetton_holders)
 
-        # Коммитим все изменения в базу данных
+        # Прогрессбар для отображения процесса вставки
+        with Progress() as progress:
+            task = progress.add_task("[green]Inserting into database...", total=total_records)
+
+            # Собираем объекты JettonHolder и Snapshot для пакетной вставки
+            jetton_holder_objects = []
+            snapshot_objects = []
+
+            for holder in jetton_holders:
+                owner_address_raw = holder.owner.address.root
+                owner_name = holder.owner.name if holder.owner.name else "Unknown"
+                raw_balance = int(holder.balance)
+                balance = raw_balance / (10 ** jetton_decimals)
+
+                # Проверяем, существует ли уже холдер
+                holder_statement = select(JettonHolder).where(JettonHolder.holder_address == owner_address_raw)
+                existing_holder = session.exec(holder_statement).first()
+
+                if not existing_holder:
+                    new_holder = JettonHolder(
+                        holder_address=owner_address_raw,
+                        owner_name=owner_name,
+                        balance=balance,
+                        jetton_id=new_jetton.id
+                    )
+                    jetton_holder_objects.append(new_holder)
+                    holder_id = new_holder.id  # Используем ID для Snapshot
+                else:
+                    existing_holder.balance = balance
+                    existing_holder.jetton_id = new_jetton.id
+                    jetton_holder_objects.append(existing_holder)
+                    holder_id = existing_holder.id  # Используем ID для Snapshot
+
+                snapshot = Snapshot(
+                    jetton_holder_id=holder_id,
+                    balance=balance,
+                    snapshot_date=datetime.now(timezone.utc)
+                )
+                snapshot_objects.append(snapshot)
+                
+                # Обновляем прогресс
+                progress.update(task, advance=1)
+
+            # Пакетная вставка холдеров и снимков
+            session.bulk_save_objects(jetton_holder_objects)
+            session.bulk_save_objects(snapshot_objects)
+
+        # Коммитим все изменения
         session.commit()
 
+        # Расчет скорости
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        speed = total_records / elapsed_time if elapsed_time > 0 else 0
+
+        # Вывод скорости вставки данных
+        console.log(f"[bold yellow]Inserted {total_records} records in {elapsed_time:.2f} seconds "
+                    f"({speed:.2f} records/second)[/bold yellow]")
+
+async def fetch_jetton_holders(tonapi, jettton_master_address, offset, semaphore):
+    async with semaphore:
+        try:
+            # Выполняем запрос с ограничением на количество параллельных запросов
+            return await tonapi.jettons.get_holders(account_id=jettton_master_address, limit=API_LIMIT, offset=offset)
+        except Exception as e:
+            console.log(f"[red]Failed to fetch data at offset {offset}: {e}[/red]")
+            return None
+
+async def get_all_jetton_holders(tonapi, jettton_master_address):
+    all_holders = []
+    offset = 0
+    semaphore = asyncio.Semaphore(10)  # Устанавливаем ограничение на 10 параллельных запросов
+
+    tasks = []
+    while True:
+        # Добавляем задачу для каждого запроса
+        tasks.append(fetch_jetton_holders(tonapi, jettton_master_address, offset, semaphore))
+        offset += API_LIMIT
+
+        # Проверяем, если задачи заполнились и выполняем их
+        if len(tasks) >= 10:
+            results = await asyncio.gather(*tasks)
+            for result in results:
+                if result and result.addresses:
+                    all_holders.extend(result.addresses)
+                else:
+                    return all_holders  # Прерываем при отсутствии данных
+            tasks.clear()
+
+    return all_holders
 
 # Declare an asynchronous function for using await
 async def main():
@@ -142,32 +248,25 @@ async def main():
     tonapi = AsyncTonapi(api_key=os.getenv("TON_API_KEY"))
 
     # Specify the account ID
-    account_id = os.getenv("TON_WALLET_ADDRESS")  # noqa
-    jettton_master_address = os.getenv("TON_JETTON_ADDRESS")  # noqa
+    account_id = os.getenv("TON_WALLET_ADDRESS")
+    jettton_master_address = os.getenv("TON_JETTON_ADDRESS")
 
     # Retrieve account information asynchronously
     account = await tonapi.accounts.get_info(account_id=account_id)
-    print(f"Account methods: {account.get_methods}")
-    print(f"Account interfaces: {account.interfaces}")
 
     if account.is_wallet:
-        print(f"Account name: {account.name}")
         print(f"Account Address (userfriendly): {account.address.to_userfriendly(is_bounceable=True)}")
-        print(f"It is a wallet")
         print(f"Account Wallet balance: {account.balance.to_amount()} TON")
     else:
         jetton = await tonapi.jettons.get_info(account_id=jettton_master_address)
-        jetton_holders = await tonapi.jettons.get_holders(account_id=jettton_master_address)
+        all_holders = await get_all_jetton_holders(tonapi, jettton_master_address)
+        #jetton_holders = await tonapi.jettons.get_holders(account_id=jettton_master_address)
         print(f"Jetton name: {jetton.metadata.name}")
         print(f"Jetton symbol: {jetton.metadata.symbol}")
-        print(f"Jetton description: {jetton.metadata.description}")
-        # Get the total supply of the jetton from decimals and total supply in raw
-        jetton_total_supply = int(jetton.total_supply) / (10 ** int(jetton.metadata.decimals))
-        print(f"Jetton total supply: {int(jetton_total_supply)} {jetton.metadata.symbol}")
-        print(f"Jetton icon: {jetton.metadata.image}")
-        print(f"Jetton Holders count: {jetton.holders_count}")
+        print(f"Jetton total supply: {int(jetton.total_supply) / (10 ** int(jetton.metadata.decimals))} {jetton.metadata.symbol}")
+        
         # Process and store holders in the database
-        await process_jetton_holders(tonapi, jetton_holders, int(jetton.metadata.decimals))
+        await process_jetton_holders(all_holders, int(jetton.metadata.decimals), jetton)
 
 
 if __name__ == '__main__':
